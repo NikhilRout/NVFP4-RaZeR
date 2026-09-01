@@ -64,12 +64,12 @@ def set_seed(seed=0):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_model_and_tokenizer(model_name, quant_config=None, device_map="auto", use_fp16: bool=False):
+def load_model_and_tokenizer(model_name, quant_config=None, device_map=None, use_fp16: bool=False):
     """
     Args:
         model_name: The model to be evaluated.
         quant_config: The quantization configuration. Will be discarded if "use_fp16=True".
-        device_map: "cpu" or "cuda" or "auto".
+        device_map: Device map used when loading the model.
         use_fp16: If set to True, then evaluate the original FP16 model.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
@@ -85,16 +85,18 @@ def load_model_and_tokenizer(model_name, quant_config=None, device_map="auto", u
             model = LlamaForCausalLM.from_pretrained(
                 model_path_fp16,
                 config=config,
-                torch_dtype=torch.bfloat16,
-                device_map=device_map
+                dtype=torch.bfloat16,
+                device_map=device_map,
+                low_cpu_mem_usage=True
             )
         else: 
             from models.qmodule_llama import QuantLlamaForCausalLM
             model = QuantLlamaForCausalLM.from_pretrained(
                 model_path_fp16,
                 config=config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map=device_map,
+                low_cpu_mem_usage=True,
                 quant_config=quant_config
             )
 
@@ -106,24 +108,27 @@ def load_model_and_tokenizer(model_name, quant_config=None, device_map="auto", u
             model = Qwen3ForCausalLM.from_pretrained(
                 model_path_fp16,
                 config=config,
-                torch_dtype=torch.bfloat16,
-                device_map=device_map
+                dtype=torch.bfloat16,
+                device_map=device_map,
+                low_cpu_mem_usage=True
             )
         else:         
             from models.qmodule_qwen3 import QuantQwen3ForCausalLM
             model = QuantQwen3ForCausalLM.from_pretrained(
                 model_path_fp16,
                 config=config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map=device_map,
+                low_cpu_mem_usage=True,
                 quant_config=quant_config
             )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path_fp16,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map=device_map
+            device_map=device_map,
+            low_cpu_mem_usage=True
         )
     
     tokenizer = AutoTokenizer.from_pretrained(

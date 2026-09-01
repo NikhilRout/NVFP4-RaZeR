@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from datasets import load_dataset
+from accelerate import infer_auto_device_map, dispatch_model
 
 import argparse
 from tqdm import tqdm
@@ -23,7 +24,7 @@ from utils import (
 )
 from quantize import quant_weight
 
-    
+
 @torch.no_grad()
 def eval_ppl(model, tokenizer, args):
     results = {}
@@ -64,7 +65,13 @@ def eval_ppl(model, tokenizer, args):
             model.seq_len = args.seq_len
 
             valenc = []
-            testenc = load_dataset("allenai/c4", data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split="validation")
+            testenc = load_dataset(
+                "allenai/c4",
+                data_files={
+                    'validation': 'en/c4-validation.00000-of-00008.json.gz'
+                },
+                split="validation"
+            )
             for _ in range(256): # run 256 samples
                 while True:
                     i = random.randint(0, len(testenc) - 1)
@@ -81,14 +88,28 @@ def eval_ppl(model, tokenizer, args):
             nlls = []
             with tqdm(range(nsamples)) as progress:
                 for i in progress:
-                    batch = testenc[:, (i * model.seq_len) : ((i + 1) * model.seq_len)].to(model.device)
+                    batch = testenc[
+                        :, (i * model.seq_len) : ((i + 1) * model.seq_len)
+                    ].to(model.device)
+
                     with torch.no_grad():
-                        lm_logits = model(batch, use_cache=False, output_hidden_states=False, output_attentions=False)[0]
+                        lm_logits = model(
+                            batch,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            output_attentions=False
+                        )[0]
+
                     shift_logits = lm_logits[:, :-1, :].contiguous().float()
-                    shift_labels = testenc[:, (i * model.seq_len) : ((i + 1) * model.seq_len)][:, 1:].to(model.device)
+                    shift_labels = testenc[
+                        :, (i * model.seq_len) : ((i + 1) * model.seq_len)
+                    ][:, 1:].to(model.device)
+
                     loss = loss_fct(
-                        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1),
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
                     )
+
                     neg_log_likelihood = loss.float() * model.seq_len
                     nlls.append(neg_log_likelihood.item())
                     progress.set_description(f"Evaluating")
@@ -110,10 +131,29 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     add_common_args(parser)
     add_quant_args(parser)
-    parser.add_argument('--datasets', type=lambda s: [item for item in s.split(',')], default=['wikitext'], help="Task to be evaled")
-    parser.add_argument('--seq_len', type=int, help='sequence length for ppl evaluation', default=2048)
-    parser.add_argument("--verbose", action="store_true", help="Whether to print verbose information or not.")
-    parser.add_argument("--output_dir", type=str, default="results/ppl", help="output directory")
+    parser.add_argument(
+        '--datasets',
+        type=lambda s: [item for item in s.split(',')],
+        default=['wikitext'],
+        help="Task to be evaled"
+    )
+    parser.add_argument(
+        '--seq_len',
+        type=int,
+        help='sequence length for ppl evaluation',
+        default=2048
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Whether to print verbose information or not."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results/ppl",
+        help="output directory"
+    )
     args = parser.parse_args()  
     
     quant_config = get_quant_config(args)
@@ -121,7 +161,11 @@ if __name__ == '__main__':
     model_name_or_path = model2path[model_name]
 
     logger.remove()
-    logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True, level="INFO" if not args.verbose else "DEBUG")
+    logger.add(
+        lambda msg: tqdm.write(msg, end=""),
+        colorize=True,
+        level="INFO" if not args.verbose else "DEBUG"
+    )
     logger.info(f"#################### Model Info ####################")
     logger.info(f"* Model: {model_name_or_path}")
     logger.info(f"* Datasets: {args.datasets}")
@@ -130,18 +174,30 @@ if __name__ == '__main__':
     logger.info("#################### Creating output directory ... ####################")
     output_dir = os.path.join(args.output_dir, model_name)
     os.makedirs(output_dir, exist_ok=True)
+
     if args.use_fp16:
         output_file_name = "Baseline_FP16.txt"
     elif not args.kv_quant:
-        output_file_name = f"w{args.w_bits}_g{args.w_groupsize}_{args.w_dtype}__a{args.a_bits}_g{args.a_groupsize}_{args.a_dtype}.txt"
+        output_file_name = (
+            f"w{args.w_bits}_g{args.w_groupsize}_{args.w_dtype}"
+            f"__a{args.a_bits}_g{args.a_groupsize}_{args.a_dtype}.txt"
+        )
     else:
-        output_file_name = f"w{args.w_bits}_g{args.w_groupsize}_{args.w_dtype}__akv{args.a_bits}_g{args.a_groupsize}_{args.a_dtype}.txt"
+        output_file_name = (
+            f"w{args.w_bits}_g{args.w_groupsize}_{args.w_dtype}"
+            f"__akv{args.a_bits}_g{args.a_groupsize}_{args.a_dtype}.txt"
+        )
 
     output_file_path = os.path.join(output_dir, f"{output_file_name}")
+
     # check if result file exists
     if os.path.isfile(output_file_path):
-        print(f'Found existing output file  {output_file_name}  for this experiment. Exit!\n\n')
+        print(
+            f'Found existing output file  {output_file_name}  '
+            f'for this experiment. Exit!\n\n'
+        )
         exit()
+
     print(f'Results will be saved to the output file:  {output_file_name}\n')
 
     logger.info(f"#################### Quantization Info ####################")
@@ -157,11 +213,47 @@ if __name__ == '__main__':
     print(f"KV-cache Quantization:              {quant_config.kv_quant}")
     print(f"==================================================")
 
-    logger.info("#################### Loading model and tokenizer ... ####################")
-    model, tokenizer = load_model_and_tokenizer(model_name, quant_config=quant_config, use_fp16=args.use_fp16)
+    logger.info(
+        "#################### Loading model and tokenizer on CPU ... ####################"
+    )
+    model, tokenizer = load_model_and_tokenizer(
+        model_name,
+        quant_config=quant_config,
+        device_map=None,
+        use_fp16=args.use_fp16
+    )
+
+    logger.info(
+        "#################### Quantizing model weights ... ####################"
+    )
     quant_weight(model, quant_config)
 
-    logger.info("#################### Start running perplexity evaluation ... ####################")
+    logger.info(
+        "#################### Dispatching model to GPU + CPU ... ####################"
+    )
+
+    max_memory = {
+        0: "12GiB",
+        "cpu": "20GiB"
+    }
+
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=[
+            "LlamaDecoderLayer",
+            "Qwen3DecoderLayer"
+        ]
+    )
+
+    model = dispatch_model(
+        model,
+        device_map=device_map
+    )
+
+    logger.info(
+        "#################### Start running perplexity evaluation ... ####################"
+    )
     res = eval_ppl(model, tokenizer, args)
 
     # Save results to JSON file
