@@ -78,6 +78,10 @@ See [`inference/README.md`](inference/README.md) for the artifact layout and [`i
 |  **hf4**                  | The [HiFloat4](https://arxiv.org/abs/2602.11287) format developed by Huawei  |
 |  **nvfp4**                | The [NVFP4](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/) format developed by NVIDIA |
 |  **nvfp4_4over6**         | The [4over6](https://arxiv.org/abs/2512.02010) format on top of NVFP4 |
+|  **nvfp4_lns8[_I.F]**     | NVFP4 with the FP8 (E4M3) block scale replaced by a logarithmic (LNS) block scale, whose base-2 exponent is a signed I.F fixed-point number (default 5.3) |
+|  **nvfp4_fp8[_E.M]**      | NVFP4 with a configurable E{E}M{M} floating-point block scale (default 4.3, identical to **nvfp4**). The FP counterpart of **nvfp4_lns8** |
+|  **nvfp4_razer_lns8_e3m3**| **nvfp4_razer_e3m3** with the block scale changed from E3M3 to LNS. E3M3 frees 2 bits for the 4 special values, so the exponent keeps 6 bits (default 3.3) |
+|  **nvfp4_razer_lns8_e4m3**| **nvfp4_razer_e4m3** with the block scale changed from E4M3 to LNS. E4M3 frees its sign bit for the 2 special values, so the exponent keeps 7 bits (default 4.3) |
 |  **nvfp4_razer_e3m3**     | The RaZeR format with E3M3 block scale and 4 special values for weight quantization |
 |  **nvfp4_razer_e4m3**     | The RaZeR format with E4M3 block scale and 2 special values for activation quantization |
 

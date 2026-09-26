@@ -2,7 +2,7 @@ import torch
 from typing import Optional
 from functools import partial
 from .quant_config import QuantConfig
-from .utils import quant_scale
+from .utils import quant_scale, quant_scale_lns, lns_exp_max, fp_scale_max, fp_scale_min
 
 
 
@@ -714,6 +714,412 @@ def quant_nvfp4_razer_e4m3(w_fp, n_bits: int=4, groupsize: Optional[int]=None):
     return w_dq.view(orig_shape).to(torch.bfloat16)
 
 
+@torch.no_grad()
+def quant_nvfp4_razer_e4m3_fixed(w_fp, n_bits: int=4, groupsize: Optional[int]=None):
+    """
+        NVFP4-RaZeR quantization with an E4M3 block scale, identical to
+        quant_nvfp4_razer_e4m3 except that the special value is picked by the
+        error against the scaled tensor rather than against the block scale.
+        Kept separate from quant_nvfp4_razer_e4m3 so that published numbers are
+        not silently changed; it is the matched control for
+        quant_nvfp4_razer_lns8, whose only remaining difference is the 8-bit
+        block scale encoding.
+    """
+    FP4_MAX      = 6.0
+    FP4_MAN_BITS = 1
+
+    orig_shape     = w_fp.shape
+    w_fp_new       = w_fp.reshape(-1, groupsize).to(torch.float32)
+    num_group      = w_fp_new.shape[0]
+
+    inlier         = 5.0
+    global_qmax    = FP4_MAX * 448
+    global_scale   = w_fp_new.abs().amax() / global_qmax
+
+    ############### Block Scale Quantization ###############
+    w_scaled      = w_fp_new / global_scale
+    block_max     = w_scaled.abs().amax(dim=-1, keepdim=True)
+    block_scale_q = (block_max / FP4_MAX).clamp(
+        max=448,
+        min=2**(-9)
+    ).to(torch.float8_e4m3fn).to(w_scaled.dtype)
+    w_scaled      = w_scaled / block_scale_q
+
+    #################### FP4 Quantization ####################
+    private_exp   = torch.floor(
+        torch.log2(
+            torch.abs(w_scaled) + (w_scaled == 0).type(w_scaled.dtype)
+        )
+    )
+    private_exp   = private_exp.clamp(min=0)
+    w_m           = w_scaled / (2**private_exp) * (2**FP4_MAN_BITS)
+    w_m           = torch.sign(w_m) * torch.floor(torch.abs(w_m) + 0.5)
+    w_q_fp4       = w_m * (2**private_exp) / (2**FP4_MAN_BITS)
+
+    ########## Search for the Optimal RaZeR-FP4 Data Type ##########
+    error     = torch.full([num_group], float('inf'), dtype=w_fp_new.dtype, device=w_fp_new.device)
+    w_q_razer = torch.zeros_like(w_fp_new)
+    for special_value in [-inlier, inlier]:
+        # Handle special value
+        w_q_razer_tmp = torch.where(
+            (w_scaled - w_q_fp4).abs() < (w_scaled - special_value).abs(),
+            w_q_fp4, special_value
+        )
+        # Dequantize and calculate error
+        quant_error            = (w_q_razer_tmp - w_scaled).pow(2).mean(-1)
+        mask_update            = torch.lt(quant_error, error)
+        error[mask_update]     = quant_error[mask_update]
+        w_q_razer[mask_update] = w_q_razer_tmp[mask_update]
+    ##################################################################
+
+    w_dq = w_q_razer * block_scale_q * global_scale
+
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+@torch.no_grad()
+def quant_nvfp4_fp8(
+    w_fp,
+    n_bits: int=4,
+    groupsize: Optional[int]=None,
+    exp_bits: int=4,
+    man_bits: int=3
+):
+    """
+        NVFP4 quantization with a configurable floating-point block scale, the
+        direct counterpart of quant_nvfp4_lns8. An exponent.mantissa split of
+        4.3 reproduces the E4M3 scale of plain NVFP4, while 5.3 and 4.4 spend
+        the redundant sign bit on range and on precision respectively.
+    """
+    FP4_MAX       = 6.0
+    FP4_MAN_BITS  = 1
+
+    SCALE_MAX     = fp_scale_max(exp_bits, man_bits)
+    SCALE_MIN     = fp_scale_min(exp_bits, man_bits)
+
+    orig_shape    = w_fp.shape
+    w_fp_new      = w_fp.reshape(-1, groupsize).to(torch.float32)
+
+    global_qmax   = FP4_MAX * SCALE_MAX
+    global_scale  = w_fp_new.abs().amax() / global_qmax
+
+    ############### Block Scale Quantization ###############
+    w_scaled      = w_fp_new / global_scale
+    block_max     = w_scaled.abs().amax(dim=-1, keepdim=True)
+    block_scale_q = quant_scale(
+        (block_max / FP4_MAX).clamp(max=SCALE_MAX, min=SCALE_MIN),
+        exp_bits, man_bits
+    )
+    w_scaled      = w_scaled / block_scale_q
+
+    #################### FP4 Quantization ####################
+    private_exp   = torch.floor(
+        torch.log2(
+            torch.abs(w_scaled) + (w_scaled == 0).type(w_scaled.dtype)
+        )
+    )
+    private_exp   = private_exp.clamp(min=0)
+    w_m           = w_scaled / (2**private_exp) * (2**FP4_MAN_BITS)
+    w_m           = torch.sign(w_m) * torch.floor(torch.abs(w_m) + 0.5)
+    w_q           = w_m * (2**private_exp) / (2**FP4_MAN_BITS)
+    w_dq          = w_q * block_scale_q * global_scale
+
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+@torch.no_grad()
+def quant_nvfp4_lns8(
+    w_fp,
+    n_bits: int=4,
+    groupsize: Optional[int]=None,
+    exp_int_bits: int=5,
+    exp_frac_bits: int=3
+):
+    """
+        NVFP4 quantization with an LNS8 block scale instead of FP8 (E4M3).
+        The block scale is a logarithmic number. Since the scale is always
+        positive, no sign bit is stored for the value and all 8 bits go to the
+        logarithm: a signed (two's complement) 5.3 fixed-point base-2 exponent.
+        The scale therefore takes the values 2**e with e in [-16, 15.875] and a
+        step of 2**(-3).
+    """
+    FP4_MAX       = 6.0
+    FP4_MAN_BITS  = 1
+
+    SCALE_MAX     = 2**lns_exp_max(exp_int_bits, exp_frac_bits)
+
+    orig_shape    = w_fp.shape
+    w_fp_new      = w_fp.reshape(-1, groupsize).to(torch.float32)
+
+    global_qmax   = FP4_MAX * SCALE_MAX
+    global_scale  = w_fp_new.abs().amax() / global_qmax
+
+    ############### Block Scale Quantization ###############
+    w_scaled      = w_fp_new / global_scale
+    block_max     = w_scaled.abs().amax(dim=-1, keepdim=True)
+    block_scale_q = quant_scale_lns(
+        block_max / FP4_MAX, exp_int_bits, exp_frac_bits
+    )
+    w_scaled      = w_scaled / block_scale_q
+
+    #################### FP4 Quantization ####################
+    private_exp   = torch.floor(
+        torch.log2(
+            torch.abs(w_scaled) + (w_scaled == 0).type(w_scaled.dtype)
+        )
+    )
+    private_exp   = private_exp.clamp(min=0)
+    w_m           = w_scaled / (2**private_exp) * (2**FP4_MAN_BITS)
+    w_m           = torch.sign(w_m) * torch.floor(torch.abs(w_m) + 0.5)
+    w_q           = w_m * (2**private_exp) / (2**FP4_MAN_BITS)
+    w_dq          = w_q * block_scale_q * global_scale
+
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+@torch.no_grad()
+def quant_nvfp4_razer_lns8_e3m3(
+    w_fp,
+    n_bits: int=4,
+    groupsize: Optional[int]=None,
+    outlier: float=8.0,
+    exp_int_bits: int=3,
+    exp_frac_bits: int=3
+):
+    """
+        NVFP4-RaZeR quantization, identical to quant_nvfp4_razer_e3m3 except
+        that the E3M3 block scale is replaced by an LNS block scale. E3M3
+        frees two bits out of the 8-bit scale to index four special values, so
+        the logarithm keeps six bits: a signed 3.3 fixed-point exponent.
+    """
+
+    inlier  = 5.0
+    datatype_list = [
+        [inlier, -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        [-inlier, -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        [outlier, -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        [-outlier, -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+    ]
+
+    #################### Reshape Tensor ####################
+    orig_shape   = w_fp.shape
+    w_fp_new     = w_fp.view(-1, groupsize).to(torch.float32)
+    num_group    = w_fp_new.shape[0]
+
+    #################### Global Scale ####################
+    SCALE_MAX    = 2**lns_exp_max(exp_int_bits, exp_frac_bits)
+    global_qmax  = 6.0 * SCALE_MAX
+    global_scale = w_fp_new.abs().amax() / global_qmax
+    #################### Block Maximum ####################
+    w_scaled     = w_fp_new / global_scale
+    block_max    = w_scaled.abs().amax(dim=-1, keepdim=True)
+
+    ############### Optimal Data Type Search ###############
+    w_q          = torch.zeros_like(w_fp_new)
+    block_scale  = torch.zeros(num_group, 1, dtype=w_fp_new.dtype, device=w_fp_new.device)
+    quant_error  = torch.full([num_group], float('inf'), dtype=w_fp_new.dtype, device=w_fp_new.device)
+    # Iterate through data types
+    for quant_value in datatype_list:
+        quant_value     = sorted(quant_value)
+        mid_value       = [(quant_value[i] + quant_value[i + 1]) / 2 for i in range(len(quant_value) - 1)]
+        qmax_tmp        = abs(max(quant_value, key=abs))
+        block_scale_tmp = quant_scale_lns(
+            block_max / qmax_tmp, exp_int_bits, exp_frac_bits
+        )
+        w_scaled_tmp    = w_scaled / block_scale_tmp
+
+        # Fake Quantization
+        w_q_tmp = torch.zeros_like(w_scaled_tmp)
+        for i, data in enumerate(quant_value):
+            if i == 0:
+                w_q_tmp += torch.where(w_scaled_tmp <= mid_value[i], data, 0)
+            elif i == len(quant_value) - 1:
+                w_q_tmp += torch.where(w_scaled_tmp > mid_value[i - 1], data, 0)
+            else:
+                w_q_tmp += torch.where((mid_value[i - 1] < w_scaled_tmp) & (w_scaled_tmp <= mid_value[i]), data, 0)
+
+        # Quantization Error
+        quant_error_tmp = (w_q_tmp*block_scale_tmp - w_scaled).pow(2).mean(dim=-1)
+        # Update Data Type if Smaller Quantization Error
+        mask_update               = torch.lt(quant_error_tmp, quant_error)
+        w_q[mask_update]          = w_q_tmp[mask_update]
+        block_scale[mask_update]  = block_scale_tmp[mask_update]
+        quant_error[mask_update]  = quant_error_tmp[mask_update]
+
+    w_dq = w_q * block_scale * global_scale
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+@torch.no_grad()
+def quant_nvfp4_razer_lns8_e4m3(
+    w_fp,
+    n_bits: int=4,
+    groupsize: Optional[int]=None,
+    exp_int_bits: int=4,
+    exp_frac_bits: int=3
+):
+    """
+        NVFP4-RaZeR quantization, identical to quant_nvfp4_razer_e4m3 except
+        that the E4M3 block scale is replaced by an LNS block scale. E4M3
+        frees its redundant sign bit to index two special values, so the
+        logarithm keeps seven bits: a signed 4.3 fixed-point exponent.
+    """
+    FP4_MAX      = 6.0
+    FP4_MAN_BITS = 1
+
+    orig_shape     = w_fp.shape
+    w_fp_new       = w_fp.reshape(-1, groupsize).to(torch.float32)
+    num_group      = w_fp_new.shape[0]
+
+    inlier         = 5.0
+    SCALE_MAX      = 2**lns_exp_max(exp_int_bits, exp_frac_bits)
+    global_qmax    = FP4_MAX * SCALE_MAX
+    global_scale   = w_fp_new.abs().amax() / global_qmax
+
+    ############### Block Scale Quantization ###############
+    w_scaled      = w_fp_new / global_scale
+    block_max     = w_scaled.abs().amax(dim=-1, keepdim=True)
+    block_scale_q = quant_scale_lns(
+        block_max / FP4_MAX, exp_int_bits, exp_frac_bits
+    )
+    w_scaled      = w_scaled / block_scale_q
+
+    #################### FP4 Quantization ####################
+    private_exp   = torch.floor(
+        torch.log2(
+            torch.abs(w_scaled) + (w_scaled == 0).type(w_scaled.dtype)
+        )
+    )
+    private_exp   = private_exp.clamp(min=0)
+    w_m           = w_scaled / (2**private_exp) * (2**FP4_MAN_BITS)
+    w_m           = torch.sign(w_m) * torch.floor(torch.abs(w_m) + 0.5)
+    w_q_fp4       = w_m * (2**private_exp) / (2**FP4_MAN_BITS)
+
+    ########## Search for the Optimal RaZeR-FP4 Data Type ##########
+    error     = torch.full([num_group], float('inf'), dtype=w_fp_new.dtype, device=w_fp_new.device)
+    w_q_razer = torch.zeros_like(w_fp_new)
+    for special_value in [-inlier, inlier]:
+        # Handle special value
+        w_q_razer_tmp = torch.where(
+            (w_scaled - w_q_fp4).abs() < (w_scaled - special_value).abs(),
+            w_q_fp4, special_value
+        )
+        # Dequantize and calculate error
+        quant_error            = (w_q_razer_tmp - block_scale_q).pow(2).mean(-1)
+        mask_update            = torch.lt(quant_error, error)
+        error[mask_update]     = quant_error[mask_update]
+        w_q_razer[mask_update] = w_q_razer_tmp[mask_update]
+    ##################################################################
+
+    w_dq = w_q_razer * block_scale_q * global_scale
+
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+@torch.no_grad()
+def quant_nvfp4_razer_lns8_e4m3_fixed(
+    w_fp,
+    n_bits: int=4,
+    groupsize: Optional[int]=None,
+    exp_int_bits: int=4,
+    exp_frac_bits: int=3
+):
+    """
+        NVFP4-RaZeR quantization with an LNS8 block scale instead of FP8 (E4M3).
+        The 8-bit block scale holds a signed (two's complement) 4.3 fixed-point
+        base-2 exponent, i.e. 2**e with e in [-8, 7.875] and a step of 2**(-3).
+        The freed 8th bit indexes the RaZeR special value (+-5), which is the
+        same redundancy that RaZeR exploits in the sign bit of an E4M3 scale.
+        Unlike quant_nvfp4_razer_lns8_e4m3, the special value is chosen by
+        the error against the scaled tensor; see quant_nvfp4_razer_e4m3_fixed.
+    """
+    FP4_MAX       = 6.0
+    FP4_MAN_BITS  = 1
+
+    exp_step      = 2**(-exp_frac_bits)
+    exp_min       = -2**(exp_int_bits - 1)
+    exp_max       = 2**(exp_int_bits - 1) - exp_step
+    SCALE_MAX     = 2**exp_max
+
+    orig_shape    = w_fp.shape
+    w_fp_new      = w_fp.reshape(-1, groupsize).to(torch.float32)
+    num_group     = w_fp_new.shape[0]
+
+    inlier        = 5.0
+    global_qmax   = FP4_MAX * SCALE_MAX
+    global_scale  = w_fp_new.abs().amax() / global_qmax
+
+    ############### Block Scale Quantization ###############
+    w_scaled      = w_fp_new / global_scale
+    block_max     = w_scaled.abs().amax(dim=-1, keepdim=True)
+    block_scale   = block_max / FP4_MAX
+    # Round the base-2 logarithm of the scale onto the fixed-point LNS grid
+    block_exp     = torch.log2(
+        block_scale + (block_scale == 0).type(block_scale.dtype)
+    )
+    block_exp     = torch.round(block_exp / exp_step) * exp_step
+    block_exp     = block_exp.clamp(min=exp_min, max=exp_max)
+    block_scale_q = torch.exp2(block_exp)
+    w_scaled      = w_scaled / block_scale_q
+
+    #################### FP4 Quantization ####################
+    private_exp   = torch.floor(
+        torch.log2(
+            torch.abs(w_scaled) + (w_scaled == 0).type(w_scaled.dtype)
+        )
+    )
+    private_exp   = private_exp.clamp(min=0)
+    w_m           = w_scaled / (2**private_exp) * (2**FP4_MAN_BITS)
+    w_m           = torch.sign(w_m) * torch.floor(torch.abs(w_m) + 0.5)
+    w_q_fp4       = w_m * (2**private_exp) / (2**FP4_MAN_BITS)
+
+    ########## Search for the Optimal RaZeR-FP4 Data Type ##########
+    error     = torch.full([num_group], float('inf'), dtype=w_fp_new.dtype, device=w_fp_new.device)
+    w_q_razer = torch.zeros_like(w_fp_new)
+    for special_value in [-inlier, inlier]:
+        # Handle special value
+        w_q_razer_tmp = torch.where(
+            (w_scaled - w_q_fp4).abs() < (w_scaled - special_value).abs(),
+            w_q_fp4, special_value
+        )
+        # Dequantize and calculate error
+        quant_error            = (w_q_razer_tmp - w_scaled).pow(2).mean(-1)
+        mask_update            = torch.lt(quant_error, error)
+        error[mask_update]     = quant_error[mask_update]
+        w_q_razer[mask_update] = w_q_razer_tmp[mask_update]
+    ##################################################################
+
+    w_dq = w_q_razer * block_scale_q * global_scale
+
+    return w_dq.view(orig_shape).to(torch.bfloat16)
+
+
+def parse_fp8_config(dtype: str, prefix: str="nvfp4_fp8"):
+    """
+        Parse the floating-point block-scale format out of a data type name,
+        e.g. "nvfp4_fp8_5.3" -> E5M3.
+    """
+    suffix = dtype[len(prefix):].lstrip("_")
+    if not suffix:
+        return {}
+    exp_bits, man_bits = (int(b) for b in suffix.split("."))
+    return {"exp_bits": exp_bits, "man_bits": man_bits}
+
+
+def parse_lns8_config(dtype: str, prefix: str="nvfp4_lns8"):
+    """
+        Parse the LNS8 block-scale exponent format out of a data type name.
+        A bare prefix (e.g. "nvfp4_lns8") keeps the default fixed-point
+        exponent, while "<prefix>_<I>.<F>" (e.g. "nvfp4_lns8_4.4") selects an
+        I.F one.
+    """
+    suffix = dtype[len(prefix):].lstrip("_")
+    if not suffix:
+        return {}
+    exp_int_bits, exp_frac_bits = (int(b) for b in suffix.split("."))
+    return {"exp_int_bits": exp_int_bits, "exp_frac_bits": exp_frac_bits}
+
+
 def quant_weight(model, quant_config: QuantConfig):
     n_bits       = quant_config.w_bits
     w_groupsize  = quant_config.w_groupsize
@@ -747,6 +1153,31 @@ def quant_weight(model, quant_config: QuantConfig):
         quant_func = quant_nvfp4
     elif (w_dtype == "nvfp4_4over6"):
         quant_func = quant_nvfp4_4over6
+    elif (w_dtype == "nvfp4_razer_e4m3_fixed"):
+        quant_func = quant_nvfp4_razer_e4m3_fixed
+    elif w_dtype.startswith("nvfp4_razer_lns8_e4m3_fixed"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e4m3_fixed,
+            **parse_lns8_config(w_dtype, prefix="nvfp4_razer_lns8_e4m3_fixed")
+        )
+    elif w_dtype.startswith("nvfp4_razer_lns8_e4m3"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e4m3,
+            **parse_lns8_config(w_dtype, prefix="nvfp4_razer_lns8_e4m3")
+        )
+    elif w_dtype.startswith("nvfp4_razer_lns8_e3m3"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e3m3,
+            outlier=w_outlier,
+            **parse_lns8_config(w_dtype, prefix="nvfp4_razer_lns8_e3m3")
+        )
+    elif w_dtype.startswith("nvfp4_lns8"):
+        quant_func = partial(quant_nvfp4_lns8, **parse_lns8_config(w_dtype))
+    elif w_dtype.startswith("nvfp4_fp8"):
+        quant_func = partial(
+            quant_nvfp4_fp8,
+            **parse_fp8_config(w_dtype)
+        )
     elif (w_dtype == "nvif4"):
         quant_func = quant_nvif4
     elif (w_dtype == "nvfp4_razer_e3m3"):
@@ -792,6 +1223,31 @@ def quant_act(act, quant_config: QuantConfig):
         quant_func = quant_nvfp4
     elif (a_dtype == "nvfp4_4over6"):
         quant_func = quant_nvfp4_4over6
+    elif (a_dtype == "nvfp4_razer_e4m3_fixed"):
+        quant_func = quant_nvfp4_razer_e4m3_fixed
+    elif a_dtype.startswith("nvfp4_razer_lns8_e4m3_fixed"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e4m3_fixed,
+            **parse_lns8_config(a_dtype, prefix="nvfp4_razer_lns8_e4m3_fixed")
+        )
+    elif a_dtype.startswith("nvfp4_razer_lns8_e4m3"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e4m3,
+            **parse_lns8_config(a_dtype, prefix="nvfp4_razer_lns8_e4m3")
+        )
+    elif a_dtype.startswith("nvfp4_razer_lns8_e3m3"):
+        quant_func = partial(
+            quant_nvfp4_razer_lns8_e3m3,
+            
+            **parse_lns8_config(a_dtype, prefix="nvfp4_razer_lns8_e3m3")
+        )
+    elif a_dtype.startswith("nvfp4_lns8"):
+        quant_func = partial(quant_nvfp4_lns8, **parse_lns8_config(a_dtype))
+    elif a_dtype.startswith("nvfp4_fp8"):
+        quant_func = partial(
+            quant_nvfp4_fp8,
+            **parse_fp8_config(a_dtype)
+        )
     elif (a_dtype == "nvif4"):
         quant_func = quant_nvif4
     elif (a_dtype == "nvfp4_razer_e4m3"):

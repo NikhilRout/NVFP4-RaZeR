@@ -77,7 +77,10 @@ def load_model_and_tokenizer(model_name, quant_config=None, device_map=None, use
 
     model_path_fp16 = model2path[model_name]
 
-    if 'llama' in model_path_fp16.lower():
+    # Mistral is architecturally Llama plus sliding-window attention and shares
+    # its tensor names, so it reuses the Llama quant modules. At seq_len 2048 the
+    # 4096 sliding window never engages, so the two are numerically equivalent.
+    if ('llama' in model_path_fp16.lower()) or ('mistral' in model_path_fp16.lower()):
         config = LlamaConfig.from_pretrained(model_path_fp16)
 
         if use_fp16:
